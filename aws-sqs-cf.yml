@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This template creates an Amazon SQS queue and DLQs."
+# Parameters are defined in your template and allow you to input custom values when you create or update a stack
+Parameters: 
+  CountryCode:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: "Your deployment environment: dev, test, qa, prod"
+  QueueName:
+    Type: String  
+  AlarmEmail: 
+    Default: "jane.doe@example.com"
+    Description: "Email address to notify of operational issues"
+    Type: String
+  VisibilityTimeout:
+    Type: Number
+    Description: "The visibility timeout of the queue"
+    Default: 30
+  DelaySeconds:
+    Type: Number
+    Description: "The delay seconds for the queue"
+    Default: 5
+  ReceiveMessageWaitTimeSeconds:
+    Type: Number
+    Description: "The Time to wait to receive a message"
+    Default: 10
+  MaxReceiveCount: 
+    Type: Number
+    Description: "The number of retries before pushing to dead letter queue"
+    Default: 3
+      
+Resources:
+
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "Encryption at rest for sqs queue"
+      EnableKeyRotation: 'True'
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-sqs-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: 
+            - "*"
+          Resource: '*'
+        - Sid: Allow access through Simple Queue Service (SQS) for all principals in the account that are authorized to use SQS
+          Effect: Allow
+          Principal: 
+            AWS: '*'
+          Action:
+            - 'kms:Encrypt'
+            - 'kms:Decrypt'
+            - 'kms:ReEncrypt*'
+            - 'kms:GenerateDataKey*'
+            - 'kms:CreateGrant'
+            - 'kms:DescribeKey'
+          Resource: '*'
+          Condition:
+            StringEquals: 
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'sqs.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-sqs-key
+  KeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: !Sub alias/${CountryCode}_${EnvironmentName}_${QueueName}-sqs
+      TargetKeyId: !Ref Key
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-queue
+      VisibilityTimeout: !Ref VisibilityTimeout
+      DelaySeconds: !Ref DelaySeconds
+      ReceiveMessageWaitTimeSeconds: !Ref ReceiveMessageWaitTimeSeconds
+      KmsMasterKeyId: !Ref Key 
+      #FifoQueue: false
+      #ContentBasedDeduplication: false
+      RedrivePolicy:
+        deadLetterTargetArn: 
+          Fn::GetAtt: 
+            - 'DeadLetterQueue'
+            - 'Arn'
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: 'Name'
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-queue
+          
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-dlq
+      KmsMasterKeyId: !Ref Key
+      Tags:
+        - Key: 'Name'
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-dlq
+    
+  QueueReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least privilege policy for the task of the batch job.
+      ManagedPolicyName: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-queue-read-ap
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:GetQueueUrl
+              - sqs:ListDeadLetterSourceQueues
+              - sqs:GetQueueAttributes
+              - sqs:ListQueueTags
+            Resource: 
+              Fn::GetAtt: 
+                - "Queue"
+                - "Arn"
+  
+  QueueWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least privilege policy for the task of the batch job.
+      ManagedPolicyName: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-queue-write-ap
+#      Path: !Sub "/${SERVICENAME}/"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+              - sqs:GetQueueUrl
+            Resource: 
+              Fn::GetAtt: 
+                - "Queue"
+                - "Arn"          
+  
+  DeadLetterQueueReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least privilege policy for the task of the batch job.
+      ManagedPolicyName: !Sub ${CountryCode}_${EnvironmentName}_${QueueName}-dlq-read-ap
+#      Path: !Sub "/${SERVICENAME}/"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:GetQueueUrl
+            Resource: 
+              Fn::GetAtt: 
+                - "DeadLetterQueue"
+                - "Arn"          
+  
+# These are the values output by the CloudFormation template. Be careful
+# about changing any of them, because some of them are exported with specific
+# names so that the other task related CF templates can use them.    
+Outputs:  
+  QueueURL: 
+    Description: "URL of Queue"
+    Value: !Ref Queue
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${QueueName}-queue
+  DeadLetterQueueURL: 
+    Description: "URL of Dead Letter Queue"
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${QueueName}-dlq
+  QueueReadPolicy:
+    Description: "Read Policy of Queue"
+    Value: !Ref QueueReadPolicy
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${QueueName}-queue-read-ap
+  QueueReadPolicy:
+    Description: "Write Policy of Queue"
+    Value: !Ref QueueWritePolicy
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${QueueName}-queue-write-ap    
+  DeadLetterQueueReadPolicy:
+    Description: "Read Policy of Dead Letter Queue"
+    Value: !Ref DeadLetterQueueReadPolicy
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${QueueName}-dlq-read-ap

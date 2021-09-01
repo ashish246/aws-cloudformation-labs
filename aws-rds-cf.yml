@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a rds instance
+
+Mappings:
+  DatabaseTypeMap:
+    postgres:
+      port: 5432
+      username: postgres
+      name: postgres
+  StorageTypeMap:
+    magnetic:
+      type: standard
+    ssd:
+      type: gp2
+    iops:
+      type: io1
+    
+Parameters:
+  CountryCode:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: "Your deployment environment: dev, test, qa, prod"
+  ServiceName:
+    Type: String  
+    Description: The service the database is for
+  SubnetType: 
+    Type: String
+    Description: "The type of subnet the rds belongs to"
+  SecretName:
+    Type: String
+    Description: The name to store the secret under    
+  Engine:
+    Type: String
+    Default: postgres
+    AllowedValues: [postgres] 
+    Description: "The type of database to use"
+  StorageType:
+    Type: String
+    Default: ssd
+    AllowedValues: [magnetic, ssd, iops]
+    Description: The storage type  
+  AllocatedStorage: 
+    Type: Number
+    Default: 20
+    Description: "The amount of storage to provide"
+  InstanceType:
+    Type: String
+    AllowedValues: [t3]
+    Default: t3
+    Description: "The instance type for the database"
+  InstanceSize:
+    Type: String
+    AllowedValues: [micro, small, medium, lare, xlarge, 2xlarge]   
+    Default: micro
+    Description: "The instance size for the database"
+  RetentionPeriod:
+    Type: Number
+    Default: 7
+    Description: "The number of days to keep backups"
+  MultiAZ: 
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+    Description: "Whether to have the database in multiple availability zones. Ignored for prod which uses true"
+    
+Conditions:
+  Prod: !Equals [!Ref EnvironmentName, PROD]
+  
+
+Resources:
+      #This is a Secret resource with a randomly generated password in its SecretString JSON.
+      MyRDSInstanceSecret:
+        Type: AWS::SecretsManager::Secret
+        Properties:
+          Description: 'This secret contains the keys needed to access the database'
+          Name: !Sub ${CountryCode}_${EnvironmentName}_${SecretName}-rds
+          GenerateSecretString:
+            SecretStringTemplate: 
+              Fn::Sub:
+                - '{"spring.datasource.username": "${FindUsername}"}}'
+                - FindUsername: !FindInMap [DatabaseTypeMap, !Ref "Engine", username]
+            GenerateStringKey: 'spring.datasource.password'
+            PasswordLength: 16
+            ExcludeCharacters: '"@/\'
+          Tags:
+            -
+              Key: Name
+              Value: !Sub ${CountryCode}_${EnvironmentName}_${SecretName}-rds
+      
+      #This is a security group which can be given to service to access the database         
+      MyDBAccessSecurityGroup:        
+        Type: AWS::EC2::SecurityGroup
+        Properties: 
+          GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-db-access-sg
+          GroupName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-db-access-sg
+          VpcId: 
+            Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+          Tags:
+            -
+              Key: Name
+              Value: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-db-access-sg  
+                    
+      
+      #This is a security group which will be assigned to the database to restrict access 
+      MyDBSecurityGroup:        
+        Type: AWS::EC2::SecurityGroup
+        Properties: 
+          GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-db-sg
+          GroupName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-db-sg
+          VpcId: 
+            Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+          Tags:
+            -
+              Key: Name
+              Value: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-db-sg  
+              
+      MyDBSecurityGroupIngress:
+        Type: 'AWS::EC2::SecurityGroupIngress'
+        Properties:
+          GroupId: !Ref 'MyDBSecurityGroup' 
+          FromPort: !FindInMap [DatabaseTypeMap, !Ref "Engine", port]
+          IpProtocol: "tcp"
+          ToPort: !FindInMap [DatabaseTypeMap, !Ref "Engine", port]
+          SourceSecurityGroupId: !Ref MyDBAccessSecurityGroup
+          
+      MyDBAccessSecurityGroupEgress:
+        Type: 'AWS::EC2::SecurityGroupEgress'
+        Properties:
+          GroupId: !Ref 'MyDBAccessSecurityGroup' 
+          FromPort: !FindInMap [DatabaseTypeMap, !Ref "Engine", port]
+          IpProtocol: "tcp"
+          ToPort: !FindInMap [DatabaseTypeMap, !Ref "Engine", port]
+          DestinationSecurityGroupId: !Ref MyDBSecurityGroup             
+        
+      #Database subnet group for the RDS instance 
+      MyDBSubnetGroup: 
+        Type: AWS::RDS::DBSubnetGroup
+        Properties: 
+          DBSubnetGroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-subnet-group
+          SubnetIds: 
+             - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-subnet-one
+             - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-subnet-two
+             
+      Key:
+        Type: AWS::KMS::Key
+        Properties:
+          Description: "Encryption at rest for rds"
+          EnableKeyRotation: 'True'
+          PendingWindowInDays: 7
+          KeyPolicy:
+            Version: 2012-10-17
+            Id: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-rds-key
+            Statement:
+            - Sid: Enable IAM User Permissions
+              Effect: Allow
+              Principal:
+                AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+              Action: 
+                - "*"
+              Resource: '*'
+            - Sid: Allow access through RDS for all principals in the account that are authorized to use RDS
+              Effect: Allow
+              Principal: 
+                AWS: '*'
+              Action:
+                - 'kms:Encrypt'
+                - 'kms:Decrypt'
+                - 'kms:ReEncrypt*'
+                - 'kms:GenerateDataKey*'
+                - 'kms:CreateGrant'
+                - 'kms:DescribeKey'
+              Resource: '*'
+              Condition:
+                StringEquals: 
+                  'kms:CallerAccount': !Ref 'AWS::AccountId'
+                  'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+          Tags:
+            - Key: Name
+              Value: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-rds-key
+      KeyAlias:
+        Type: 'AWS::KMS::Alias'
+        Properties:
+          AliasName: !Sub alias/${CountryCode}_${EnvironmentName}_${ServiceName}-rds
+          TargetKeyId: !Ref Key     
+
+      #This is an RDS instance resource. Its master username and password use dynamic references to resolve values from 
+      #SecretsManager. The dynamic reference guarantees that CloudFormation will not log or persist the resolved value 
+      #We sub the Secret resource's logical id in order to construct the dynamic reference, since the Secret's name is being #generated by CloudFormation
+      MyDBInstance:
+        Type: AWS::RDS::DBInstance
+        Properties:
+          AllocatedStorage: !Ref 'AllocatedStorage'
+          DBInstanceClass:  !Sub db.${InstanceType}.${InstanceSize}
+          DBInstanceIdentifier: !Sub ${CountryCode}-${EnvironmentName}-${ServiceName}
+          DBName: !FindInMap [DatabaseTypeMap, !Ref "Engine", name]
+          Engine: !Ref 'Engine'
+          DBSubnetGroupName: !Ref 'MyDBSubnetGroup'
+          MasterUsername: !Sub '{{resolve:secretsmanager:${MyRDSInstanceSecret}::spring.datasource.username}}'
+          MasterUserPassword: !Sub '{{resolve:secretsmanager:${MyRDSInstanceSecret}::spring.datasource.password}}'
+          BackupRetentionPeriod: !Ref 'RetentionPeriod'
+          MultiAZ: !If [Prod, true, !Ref MultiAZ]
+          StorageEncrypted: true
+          KmsKeyId: !Ref Key
+          StorageType: !FindInMap [StorageTypeMap, !Ref "StorageType", type]
+          VPCSecurityGroups:
+            - !Ref 'MyDBSecurityGroup'
+            - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:db-sg
+            
+      SecretsManagerAccessPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+          Description: Role to access the db secrets
+          ManagedPolicyName: !Sub ${CountryCode}_${EnvironmentName}_${SecretName}-rds-secret-read-ap
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref MyRDSInstanceSecret
+
+      
+# These are the values output by the CloudFormation template. Be careful
+# about changing any of them, because some of them are exported with specific
+# names so that the other task related CF templates can use them.
+Outputs:
+  DBEndpoint:
+    Description: The endpoint of the rds
+    Value: !Sub '${MyDBInstance.Endpoint.Address}:${MyDBInstance.Endpoint.Port}'
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${ServiceName}-endpoint
+  DBName:
+    Description: The name of the database
+    Value: !FindInMap [DatabaseTypeMap, !Ref "Engine", name]
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${ServiceName}-dbname
+  DBAccessSecurityGroup:
+    Description: The name of the security group required to access the database
+    Value: !Ref 'MyDBAccessSecurityGroup'
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${ServiceName}-db-access-sg
+  SecretsManagerAccessPolicy:
+    Description: The access policy to allow access to the secret storing the database username and password
+    Value: !Ref 'SecretsManagerAccessPolicy'
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${SecretName}-rds-secret-read-ap  

@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private load balancer, for forwarding traffic to containers
+Parameters:
+  CountryCode:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: "Your deployment environment: dev, test, qa, prod"
+  SubnetType:
+    Type: String
+    Description: The Subnet to create the load balancer in
+  AllowContainerTwoWayCommunication:
+    Type: String
+    Default: false  
+    AllowedValues: [true, false]
+    Description: Whether containers need to talk back to the load balancer
+      
+Conditions:
+  ContainerTwoWayCommunication: !Equals [!Ref AllowContainerTwoWayCommunication, true]
+
+Resources:
+  #This is a security group which will allow the ALB to talk to the container         
+  ContainerAccessSecurityGroup:        
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-container-access-sg
+      GroupName: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-container-access-sg
+      VpcId: 
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-container-access-sg  
+                
+  
+  #This is a security group which will be assigned to the container to allow the ALB to talk to it 
+  ContainerSecurityGroup:        
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-container-sg
+      GroupName: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-container-sg
+      VpcId: 
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: -1
+          CidrIpv6: ::/0      
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-container-sg  
+          
+  ContainerSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref 'ContainerSecurityGroup' 
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ContainerAccessSecurityGroup
+      
+  ContainerSecurityGroupEgress:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Condition: ContainerTwoWayCommunication
+    Properties:
+      GroupId: !Ref 'ContainerSecurityGroup' 
+      IpProtocol: -1
+      DestinationSecurityGroupId: !Ref ContainerAccessSecurityGroup
+      
+  ContainerAccessSecurityGroupEgress:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      GroupId: !Ref 'ContainerAccessSecurityGroup' 
+      IpProtocol: -1
+      DestinationSecurityGroupId: !Ref ContainerSecurityGroup
+      
+  ContainerAccessSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: ContainerTwoWayCommunication
+    Properties:
+      GroupId: !Ref 'ContainerAccessSecurityGroup' 
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ContainerSecurityGroup    
+
+  #This is a security group which will allow services to talk to the LoadBalancer        
+  LoadBalancerAccessSecurityGroup:        
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-load-balancer-access-sg
+      GroupName: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-load-balancer-access-sg
+      VpcId: 
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-load-balancer-access-sg  
+                
+  
+  #This is a security group which will be assigned to the LoadBalancer to allow services to talk to it 
+  LoadBalancerSecurityGroup:        
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-load-balancer-sg
+      GroupName: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-load-balancer-sg
+      VpcId: 
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-load-balancer-sg  
+          
+  LoadBalancerSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref 'LoadBalancerSecurityGroup'
+      IpProtocol: "-1" 
+      SourceSecurityGroupId: !Ref LoadBalancerAccessSecurityGroup
+      
+  LoadBalancerAccessSecurityGroupEgress:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      GroupId: !Ref 'LoadBalancerAccessSecurityGroup' 
+      IpProtocol: "-1"
+      DestinationSecurityGroupId: !Ref LoadBalancerSecurityGroup 
+            
+  PrivateLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Name: !Sub ${CountryCode}-${EnvironmentName}-${SubnetType}-alb 
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        # The load balancer is placed into the private subnets
+        - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-subnet-one
+        - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-subnet-two
+      SecurityGroups: [!Ref 'LoadBalancerSecurityGroup', !Ref 'ContainerAccessSecurityGroup']
+      Tags:
+        -
+          Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${SubnetType}-alb
+      
+  # A dummy target group is used to setup the ALB to just drop traffic
+  # initially, before any real service target groups have been added.
+  DummyTargetGroupPrivate:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+        
+  PrivateLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PrivateLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'DummyTargetGroupPrivate'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PrivateLoadBalancer'
+      Port: 80
+      Protocol: HTTP
+      
+
+# These are the values output by the CloudFormation template. Be careful
+# about changing any of them, because some of them are exported with specific
+# names so that the other task related CF templates can use them.
+Outputs:
+  PrivateListener:
+    Description: The ARN of the public load balancer's Listener
+    Value: !Ref PrivateLoadBalancerListener
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-alb-listener
+  PrivateAlb:
+    Description: The DNS name of the private load balancer
+    Value: !Sub http://${PrivateLoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-alb
+  ContainerSecurityGroup:    
+    Description: The Security group allowing the ALB to talk to a container
+    Value: !Ref ContainerSecurityGroup
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-container-sg
+  LoadBalancerAccessSecurityGroup:
+    Description: The Security group allowing talking to the ALB
+    Value: !Ref LoadBalancerAccessSecurityGroup
+    Export:
+      Name: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-load-balancer-access-sg
+      

@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Deploy a service on AWS Fargate, hosted in a private subnet, but accessible via a private load balancer
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: "Your deployment environment: dev, test, qa, prod"
+  CountryCode:
+    Type: String
+    Default: au
+    Description: "Country code"
+  ServiceName:
+    Type: String
+    Description: A name for the service
+  DockerImageName:
+    Type: String
+    Description: The image name of a bucket that contains the versions
+  DockerImageTag:
+    Type: String
+    Default: latest
+    Description: The version name of the zip file to load
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: The amount of memory to allocate
+  LambdaRate:
+    Type: String
+    Default: ""
+    Description: Cron expression for automatically running the lambda
+  ApiGatewayRequired:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+    Description: Whether the lambda requires the api gateway environment
+  ManagedPolicies:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: List of managed policies to assign to the role given to the ecs
+
+Conditions:
+  UsesApiGateway: !Equals [!Ref ApiGatewayRequired, "true"]
+  HasManagedPolicies: !Not [!Equals [!Join ["", !Ref ManagedPolicies], ""]]
+  CreateSchedule: !Not [!Equals [!Ref LambdaRate, ""]]
+
+Resources:
+  # Task Role is used when code running inside the lambda needs access to AWS resources
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: LambdaRolePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DescribeInstances"
+                  - "ec2:AttachNetworkInterface"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${CountryCode}_${EnvironmentName}_${ServiceName}-lambda:*"
+      ManagedPolicyArns:
+        !If [HasManagedPolicies, !Ref ManagedPolicies, !Ref "AWS::NoValue"]
+
+  #This is a security group which will be assigned to the lambda
+  MyLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-lambda-sg
+      GroupName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-lambda-sg
+      VpcId:
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-lambda-sg
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-lambda
+      Description: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-lambda
+      Code:
+        ImageUri: !Sub ${AWS::AccountId}.dkr.ecr.ap-southeast-2.amazonaws.com/${DockerImageName}:${DockerImageTag}
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 10
+      PackageType: Image
+      Role:
+        Fn::GetAtt:
+          - Role
+          - Arn
+      TracingConfig:
+        Mode: Active
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:subnet-one
+          - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:subnet-two
+        SecurityGroupIds:
+          - !Ref MyLambdaSecurityGroup
+      Environment:
+        Variables:
+          ENVIRONMENT: !Sub ${CountryCode}_${EnvironmentName}
+
+  #Trigger
+  LambdaSchedule:
+    Type: AWS::Events::Rule
+    Condition: CreateSchedule
+    Properties:
+      Description: A schedule for the Lambda function..
+      ScheduleExpression: !Ref LambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${LambdaFunction.Arn}
+          Id: LambdaSchedule
+
+  LambdaSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateSchedule
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Sub ${LambdaFunction.Arn}
+      Principal: "events.amazonaws.com"
+      SourceArn: !Sub ${LambdaSchedule.Arn}

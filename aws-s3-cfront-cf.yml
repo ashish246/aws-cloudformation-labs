@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  CertificateArn:
+    Type: String
+    Description: Certificate must be created before CloudFormation stack so the value is fixed
+  BucketName:
+    Type: String
+  DomainName:
+    Type: String
+
+Resources:
+  S3Hosting:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: "Private"
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls : true
+        BlockPublicPolicy : true
+        IgnorePublicAcls : true
+        RestrictPublicBuckets : true    
+
+  # Declare the identity of our CloudFront distribution
+  CDNOriginIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "Cloudfront Origin identity for ${DomainName}"
+
+  CDN:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          TargetOriginId: !Sub "S3-origin-${S3Hosting}"
+          CachePolicyId: "658327ea-f89d-4fab-a63d-7e88639e58f6"
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: True
+        HttpVersion: http2
+        IPV6Enabled: True
+        Origins:
+          - DomainName: !GetAtt S3Hosting.RegionalDomainName
+            Id: !Sub "S3-origin-${S3Hosting}"
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CDNOriginIdentity}"
+        PriceClass: PriceClass_All # PriceClass_100 / PriceClass_200 / PriceClass_All
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          MinimumProtocolVersion: TLSv1.2_2018
+          SslSupportMethod: sni-only
+          # ... some configs are omitted for brievity
+          TargetOriginId: !Sub "S3-origin-${S3Hosting}"
+          # This is where we define the HTTPS redirection
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: True
+        Origins:
+          - DomainName: !GetAtt S3Hosting.RegionalDomainName
+            Id: !Sub "S3-origin-${S3Hosting}"
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CDNOriginIdentity}"
+        PriceClass: PriceClass_100 # PriceClass_100 / PriceClass_200 / PriceClass_All
+        # The SSL certificate used
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          MinimumProtocolVersion: TLSv1.2_2018
+          SslSupportMethod: sni-only
+
+  S3HostingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Hosting
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "s3:GetObject"
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CDNOriginIdentity}"
+            Resource: !Sub "arn:aws:s3:::${S3Hosting}/*"
+        Version: "2012-10-17"

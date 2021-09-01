@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: External, public facing api gateway, for forwarding public traffic to private load balancers
+Parameters:
+  CountryCode:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: "Your deployment environment: dev, test, qa, prod"
+  DomainName:
+    Type: String
+    Description: "The domain name for the api gateway"
+  CertificateArn:
+    Type: String
+    Description: "The certificate for the given domain name"
+
+Resources:
+  #---------------------------------------------------------------------
+  # Deploy API GW VPC Link
+  #---------------------------------------------------------------------
+
+  PrivateAPIGWvpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub ${CountryCode}_${EnvironmentName}_gateway-vpclink
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:service-load-balancer-access-sg
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:service-subnet-one
+        - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:service-subnet-two
+
+  MyDomainName:
+    Type: "AWS::ApiGatewayV2::DomainName"
+    Properties:
+      DomainName: !Ref "DomainName"
+      DomainNameConfigurations:
+        - EndpointType: REGIONAL
+          CertificateArn: !Ref CertificateArn
+
+  MyApiMapping:
+    Type: "AWS::ApiGatewayV2::ApiMapping"
+    Properties:
+      DomainName: !Ref "DomainName"
+      ApiId: !Ref APIGateway
+      Stage: !Ref APIStage
+
+  # The api gateway
+  APIGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${CountryCode}_${EnvironmentName}_gateway"
+      Description: !Sub "${CountryCode}_${EnvironmentName}_gateway"
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: true
+
+  APIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "ANY /{service}/{path+}"
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref APIIntegration
+
+  APIIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      Description: Private ALB Integration
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref PrivateAPIGWvpcLink
+      IntegrationUri:
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:service-alb-listener
+      RequestParameters:
+        {
+          "overwrite:header.X-Service-Name": "$request.path.service",
+          "overwrite:path": "/$request.path.path",
+        }
+      PayloadFormatVersion: "1.0"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: !Sub "${CountryCode}_${EnvironmentName}_gateway-log-group"
+
+  APIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: $default
+      AutoDeploy: true
+      ApiId: !Ref APIGateway
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        #ThrottlingBurstLimit: 10
+        #ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt "LogGroup.Arn"
+        Format: >-
+          { "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", 
+          "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey", "status":"$context.status",
+          "protocol":"$context.protocol", "responseLength":"$context.responseLength" }

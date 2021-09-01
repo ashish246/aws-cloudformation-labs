@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Deploy a service on AWS Fargate, hosted in a private subnet, but accessible via a private load balancer
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: test
+    Description: "Your deployment environment: dev, test, qa, prod"
+  CountryCode:
+    Type: String
+    Default: au
+    Description: "Country code"
+  SubnetType:
+    Type: String
+    AllowedValues: [service, config]
+    Default: service
+    Description: "The type of subnet the service belongs to"
+  ServiceName:
+    Type: String
+    Description: A name for the service
+  DockerImageName:
+    Type: String
+    Description:
+      The image name of a docker image that contains the application process that
+      will handle the traffic for this service
+  DockerImageTag:
+    Type: String
+    Default: latest
+    Description:
+      The image tag of a docker image that contains the application process that
+      will handle the traffic for this service
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: What port number the application inside the docker container is binding to
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container
+  Priority:
+    Type: Number
+    Default: 1
+    Description: The priority for the routing rule added to the load balancer.
+      This only applies if your have multiple services which have been
+      assigned to different paths on the load balancer.
+  HealthCheckGracePeriod:
+    Type: Number
+    Default: 300
+    Description: Health check grace period in seconds to allow services to boot up. Defaults to 5 minutes
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: How many copies of the service task to run
+  DatabaseInstance:
+    Type: String
+    Default: ""
+    Description: Whether the service uses a database
+  ManagedPolicies:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: List of managed policies to assign to the role given to the ecs
+
+Conditions:
+  UseListenerPath: !Equals [!Ref SubnetType, "config"]
+  UsesConfigServer: !Not [!Equals [!Ref SubnetType, "config"]]
+  UsesDatabase: !Not [!Equals [!Ref DatabaseInstance, ""]]
+  HasManagedPolicies: !Not [!Equals [!Join ["", !Ref ManagedPolicies], ""]]
+
+Resources:
+  # A log group for storing the stdout logs from this service's containers
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-service
+
+  # Task Role is used when code running inside the container needs access to AWS resources
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role assumed by the Task Definition to carry out the task itself.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      RoleName: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-role
+      Policies:
+        - PolicyName: ECSExecSSMAgentRolePolicy
+          # Description: Role to grant containers the permissions needed for communication between the managed SSM agent (execute-command agent) and the SSM service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssmmessages:CreateControlChannel"
+                  - "ssmmessages:CreateDataChannel"
+                  - "ssmmessages:OpenControlChannel"
+                  - "ssmmessages:OpenDataChannel"
+                Resource: "*"
+      ManagedPolicyArns:
+        !If [HasManagedPolicies, !Ref ManagedPolicies, !Ref "AWS::NoValue"]
+
+  # The task definition. This is a simple metadata description of what
+  # container to run, and what resource requirements it has.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref "ServiceName"
+      Cpu: !Ref "ContainerCpu"
+      Memory: !Ref "ContainerMemory"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue: ECSTaskExecutionRole
+      TaskRoleArn: !Ref Role
+      ContainerDefinitions:
+        - Name: !Ref "ServiceName"
+          Cpu: !Ref "ContainerCpu"
+          Memory: !Ref "ContainerMemory"
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.ap-southeast-2.amazonaws.com/${DockerImageName}:${DockerImageTag}
+          Environment:
+            - Fn::If:
+                - "UsesConfigServer"
+                - Name: CONFIG_SERVER_URL
+                  Value:
+                    Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:service-alb
+                - !Ref "AWS::NoValue"
+            - Fn::If:
+                - "UsesDatabase"
+                - Name: DATASOURCE_URL
+                  Value:
+                    Fn::Sub:
+                      - "${endpoint}/${dbname}"
+                      - endpoint:
+                          Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${DatabaseInstance}-endpoint
+                        dbname:
+                          Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${DatabaseInstance}-dbname
+                - !Ref "AWS::NoValue"
+            - Name: QUEUE_PREFIX
+              Value: !Sub ${CountryCode}_${EnvironmentName}
+            - Name: COUNTRY_CODE
+              Value: !Sub ${CountryCode}
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !Sub ${EnvironmentName}
+            - Name: AWS_REGION
+              Value: !Ref "AWS::Region"
+          PortMappings:
+            - ContainerPort: !Ref "ContainerPort"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub ${CountryCode}_${EnvironmentName}_${ServiceName}-service
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: !Ref "ServiceName"
+
+  # The service. The service is a resource which allows you to run multiple
+  # copies of a type of task, and gather up their logs and metrics, as well
+  # as monitor the number of running tasks and replace any that have crashed
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerRule
+    Properties:
+      ServiceName: !Ref "ServiceName"
+      Cluster:
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:ecs-cluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref "DesiredCount"
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-container-sg
+            - Fn::If:
+                - "UsesConfigServer"
+                - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:config-load-balancer-access-sg
+                - !Ref "AWS::NoValue"
+            - Fn::If:
+                - "UsesDatabase"
+                - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${DatabaseInstance}-db-access-sg
+                - !Ref "AWS::NoValue"
+          Subnets:
+            - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-subnet-one
+            - Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-subnet-two
+      TaskDefinition: !Ref "TaskDefinition"
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: !Ref "HealthCheckGracePeriod"
+      LoadBalancers:
+        - ContainerName: !Ref "ServiceName"
+          ContainerPort: !Ref "ContainerPort"
+          TargetGroupArn: !Ref "TargetGroup"
+
+  # A target group. This is used for keeping track of all the tasks, and
+  # what IP addresses / port numbers they have. You can query it yourself,
+  # to use the addresses yourself, but most often this target group is just
+  # connected to an application load balancer, or network load balancer, so
+  # it can automatically distribute traffic across all the targets.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /actuator/health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 9
+      HealthyThresholdCount: 2
+      HealthCheckPort: "9000"
+      TargetType: ip
+      Name: !Join ["-", [!Ref ServiceName, "service", "TG"]]
+      Port: !Ref "ContainerPort"
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:vpc
+
+  # Create a rule on the load balancer for routing traffic to the target group
+  LoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref "TargetGroup"
+          Type: "forward"
+      Conditions:
+        Fn::If:
+          - "UseListenerPath"
+          - - Field: path-pattern
+              Values: ["*"]
+          - - Field: http-header
+              HttpHeaderConfig:
+                HttpHeaderName: "X-Service-Name"
+                Values: [!Ref "ServiceName"]
+      ListenerArn:
+        Fn::ImportValue: !Sub ${CountryCode}:${EnvironmentName}:${SubnetType}-alb-listener
+      Priority: !Ref "Priority"
